@@ -8,11 +8,11 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.RectF
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
 import android.os.Handler
@@ -112,6 +112,7 @@ class NoiseService : Service() {
         stopVoiceNow()
         handler.removeCallbacks(timerTick)
         runCatching { mediaSession.release() }
+        runCatching { audioManager.abandonAudioFocusRequest(focusRequest) }
         super.onDestroy()
     }
 
@@ -123,6 +124,12 @@ class NoiseService : Service() {
      */
     private fun playType(type: NoiseType) {
         if (currentType == type) return
+        resumeOnFocusGain = false
+        // Exclusive with other media: this pauses e.g. Spotify, and if
+        // focus is denied we don't play over whatever holds it.
+        if (audioManager.requestAudioFocus(focusRequest) !=
+            AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        ) return
         stopVoiceNow()
         val pcm = buffers.getOrPut(type) { NoiseGenerator.generate(type) }
         val minBuf = AudioTrack.getMinBufferSize(
@@ -170,8 +177,14 @@ class NoiseService : Service() {
         voice = Voice(track, running, thread)
         currentType = type
         lastType = type
-        // A started sound kicks off an armed timer's countdown.
-        if (armedTimerMinutes > 0 && timerEndMillis == null) startCountdown()
+        // A started sound kicks off an armed timer's countdown, or resumes
+        // one frozen by a focus-loss pause.
+        val frozen = frozenTimerRemainingMs
+        frozenTimerRemainingMs = null
+        if (frozen != null && frozen > 0) {
+            timerEndMillis = System.currentTimeMillis() + frozen
+            handler.post(timerTick)
+        } else if (armedTimerMinutes > 0 && timerEndMillis == null) startCountdown()
         mediaSession.setMetadata(
             MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "${type.displayName} noise")
@@ -192,7 +205,11 @@ class NoiseService : Service() {
      * User-initiated stop/pause: stops audio immediately and resets a
      * running timer countdown to its full (armed) duration.
      */
-    private fun pausePlayback() {
+    private fun pausePlayback(abandonFocus: Boolean = true) {
+        if (abandonFocus) {
+            resumeOnFocusGain = false
+            audioManager.abandonAudioFocusRequest(focusRequest)
+        }
         stopVoiceNow()
         timerEndMillis = null
         handler.removeCallbacks(timerTick)
@@ -223,6 +240,9 @@ class NoiseService : Service() {
     }
 
     private fun stopAll() {
+        resumeOnFocusGain = false
+        frozenTimerRemainingMs = null
+        audioManager.abandonAudioFocusRequest(focusRequest)
         stopVoiceNow()
         handler.removeCallbacks(timerTick)
         timerEndMillis = null
@@ -333,29 +353,78 @@ class NoiseService : Service() {
     private val artworkCache = EnumMap<NoiseType, Bitmap>(NoiseType::class.java)
 
     /**
-     * Album artwork for the media notification: the sound's tint color with
-     * the white wave glyph on top. Media notifications derive their
-     * background tint from the artwork, so this is what colors the
-     * notification per sound.
+     * Album artwork for the media notification: a flat square in the
+     * sound's tint color. Media notifications derive their background
+     * tint from the artwork, so this is what colors the notification
+     * per sound.
      */
     private fun artworkFor(type: NoiseType): Bitmap =
         artworkCache.getOrPut(type) {
-            val size = 512
+            val size = 256
             val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bmp)
-            canvas.drawColor(type.notifTint)
-            val wave = BitmapFactory.decodeResource(resources, R.drawable.ic_wave)
-            val s = size * 0.62f
-            canvas.drawBitmap(
-                wave, null,
-                RectF(
-                    (size - s) / 2, (size - s) / 2,
-                    (size + s) / 2, (size + s) / 2
-                ),
-                null
-            )
+            Canvas(bmp).drawColor(type.notifTint)
             bmp
         }
+
+    // ---- audio focus: noise is exclusive with other media apps ----
+
+    private val audioManager by lazy { getSystemService(AudioManager::class.java) }
+
+    private val focusRequest by lazy {
+        AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener(
+                ::onAudioFocusChange, Handler(Looper.getMainLooper())
+            )
+            .build()
+    }
+
+    /** Remaining sleep-timer ms frozen by a focus-loss pause, if a countdown was running. */
+    private var frozenTimerRemainingMs: Long? = null
+
+    /** True when a transient focus loss paused us and we should resume on regain. */
+    private var resumeOnFocusGain = false
+
+    private fun onAudioFocusChange(change: Int) {
+        when (change) {
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                // Another app (e.g. Spotify) took over: pause and stay paused.
+                if (voice != null) pauseForFocusLoss(transient = false)
+                audioManager.abandonAudioFocusRequest(focusRequest)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Brief interruption (notification, nav prompt): pause but
+                // keep the focus request so we resume when focus returns,
+                // unless the user steps in first.
+                if (voice != null) pauseForFocusLoss(transient = true)
+            }
+            AudioManager.AUDIOFOCUS_GAIN ->
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false
+                    resumeLast()
+                }
+        }
+    }
+
+    /**
+     * Pause caused by losing audio focus: freeze a running sleep-timer
+     * countdown instead of resetting it, so it resumes where it left off.
+     */
+    private fun pauseForFocusLoss(transient: Boolean) {
+        frozenTimerRemainingMs = timerEndMillis?.let {
+            (it - System.currentTimeMillis()).coerceAtLeast(0L)
+        }
+        timerEndMillis = null
+        handler.removeCallbacks(timerTick)
+        resumeOnFocusGain = transient
+        pausePlayback(abandonFocus = !transient)
+    }
 
     private fun buildNotification(): Notification {
         val playing = voice != null
