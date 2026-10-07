@@ -11,8 +11,8 @@ android {
         applicationId = "com.noisemachine.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "3"
+        versionCode = 6
+        versionName = "4"
     }
 
     buildTypes {

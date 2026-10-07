@@ -397,11 +397,14 @@ class NoiseService : Service() {
                 if (voice != null) pauseForFocusLoss(transient = false)
                 audioManager.abandonAudioFocusRequest(focusRequest)
             }
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                // Brief interruption (notification, nav prompt): pause but
-                // keep the focus request so we resume when focus returns,
-                // unless the user steps in first.
+                // Notification dings, nav prompts: keep playing underneath.
+                // They mix over the noise without pausing or ducking it.
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                // Exclusive transient use (phone call, voice assistant):
+                // pause but keep the focus request so we resume when focus
+                // returns, unless the user steps in first.
                 if (voice != null) pauseForFocusLoss(transient = true)
             }
             AudioManager.AUDIOFOCUS_GAIN ->
