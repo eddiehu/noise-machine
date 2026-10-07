@@ -22,7 +22,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
@@ -54,6 +56,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
@@ -217,36 +220,34 @@ class MainActivity : ComponentActivity() {
                         .fillMaxWidth(),
                     contentAlignment = Alignment.Center
                 ) {
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(20.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
-                            modifier = Modifier.fillMaxWidth()
+                    // Size buttons from both dimensions so the grid never
+                    // overflows (and clips) on short screens, e.g. landscape
+                    // or fold cover displays. Capped so large screens don't
+                    // get ridiculous buttons.
+                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                        val cellWidth = (maxWidth - 16.dp) / 2
+                        // Per cell: button + 10dp spacer + ~20dp label;
+                        // rows are spaced 20dp apart.
+                        val maxByHeight = ((maxHeight - 20.dp) / 2 - 30.dp)
+                            .coerceAtLeast(0.dp)
+                        val diameter = minOf(cellWidth, maxByHeight, 200.dp)
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.align(Alignment.Center)
                         ) {
-                            Box(
-                                modifier = Modifier.weight(1f),
-                                contentAlignment = Alignment.Center
-                            ) { NoiseCell(NoiseType.WHITE) }
-                            Box(
-                                modifier = Modifier.weight(1f),
-                                contentAlignment = Alignment.Center
-                            ) { NoiseCell(NoiseType.PINK) }
-                        }
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Box(
-                                modifier = Modifier.weight(1f),
-                                contentAlignment = Alignment.Center
-                            ) { NoiseCell(NoiseType.BROWN) }
-                            Box(
-                                modifier = Modifier.weight(1f),
-                                contentAlignment = Alignment.Center
-                            ) { NoiseCell(NoiseType.GREEN) }
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                NoiseCell(NoiseType.WHITE, diameter)
+                                NoiseCell(NoiseType.PINK, diameter)
+                            }
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                NoiseCell(NoiseType.BROWN, diameter)
+                                NoiseCell(NoiseType.GREEN, diameter)
+                            }
                         }
                     }
                 }
@@ -353,12 +354,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun NoiseCell(type: NoiseType) {
+    private fun NoiseCell(type: NoiseType, diameter: Dp) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             NoiseButton(
                 type = type,
                 active = activeTypes.contains(type),
-                onToggle = { toggle(type) }
+                onToggle = { toggle(type) },
+                diameter = diameter
             )
             Spacer(modifier = Modifier.height(10.dp))
             Text(
@@ -374,14 +376,13 @@ class MainActivity : ComponentActivity() {
     private fun NoiseButton(
         type: NoiseType,
         active: Boolean,
-        onToggle: () -> Unit
+        onToggle: () -> Unit,
+        diameter: Dp
     ) {
         val glow = type.glowColor
         Box(
             modifier = Modifier
-                .sizeIn(maxWidth = 200.dp, maxHeight = 200.dp)
-                .fillMaxWidth()
-                .aspectRatio(1f)
+                .size(diameter)
                 .graphicsLayer {
                     shadowElevation = 18.dp.toPx()
                     ambientShadowColor = if (active) glow else Color.Black

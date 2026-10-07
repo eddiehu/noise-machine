@@ -352,6 +352,8 @@ class NoiseService : Service() {
             .setContentText(timerText())
             .setSmallIcon(R.drawable.ic_wave)
             .setContentIntent(openIntent)
+            .setColor((currentType ?: lastType)?.notifTint ?: 0xFF14243D.toInt())
+            .setColorized(true)
             .addAction(
                 if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
                 if (playing) "Pause" else "Play",
