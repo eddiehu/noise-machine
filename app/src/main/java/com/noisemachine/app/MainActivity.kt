@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -66,6 +67,11 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
+
+    private val soundRows = listOf(
+        listOf(NoiseType.WHITE, NoiseType.PINK),
+        listOf(NoiseType.BROWN, NoiseType.GREEN)
+    )
 
     private var activeTypes by mutableStateOf(setOf<NoiseType>())
     private var timerEndMillis by mutableStateOf(0L)
@@ -220,33 +226,52 @@ class MainActivity : ComponentActivity() {
                         .fillMaxWidth(),
                     contentAlignment = Alignment.Center
                 ) {
-                    // Size buttons from both dimensions so the grid never
-                    // overflows (and clips) on short screens, e.g. landscape
-                    // or fold cover displays. Capped so large screens don't
-                    // get ridiculous buttons.
-                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                        val cellWidth = (maxWidth - 16.dp) / 2
-                        // Per cell: button + 10dp spacer + ~20dp label;
-                        // rows are spaced 20dp apart.
-                        val maxByHeight = ((maxHeight - 20.dp) / 2 - 30.dp)
-                            .coerceAtLeast(0.dp)
-                        val diameter = minOf(cellWidth, maxByHeight, 200.dp)
-                        Column(
-                            verticalArrangement = Arrangement.spacedBy(20.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.align(Alignment.Center)
-                        ) {
+                    // Each cell gives the label its natural height first and
+                    // the button takes the rest, so labels can never clip no
+                    // matter the screen shape or font scale. Buttons are
+                    // capped so large screens stay sensible.
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        soundRows.forEach { rowTypes ->
                             Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(16.dp)
                             ) {
-                                NoiseCell(NoiseType.WHITE, diameter)
-                                NoiseCell(NoiseType.PINK, diameter)
-                            }
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(16.dp)
-                            ) {
-                                NoiseCell(NoiseType.BROWN, diameter)
-                                NoiseCell(NoiseType.GREEN, diameter)
+                                rowTypes.forEach { type ->
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxHeight(),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        BoxWithConstraints(
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .fillMaxWidth(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            val d = minOf(maxWidth, maxHeight, 200.dp)
+                                            NoiseButton(
+                                                type = type,
+                                                active = activeTypes.contains(type),
+                                                onToggle = { toggle(type) },
+                                                diameter = d
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Text(
+                                            text = type.displayName,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFFEEF2F8).copy(alpha = 0.78f),
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -349,25 +374,6 @@ class MainActivity : ComponentActivity() {
                 fontSize = 12.5.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color(0xFFEEF2F8)
-            )
-        }
-    }
-
-    @Composable
-    private fun NoiseCell(type: NoiseType, diameter: Dp) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            NoiseButton(
-                type = type,
-                active = activeTypes.contains(type),
-                onToggle = { toggle(type) },
-                diameter = diameter
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-            Text(
-                text = type.displayName,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color(0xFFEEF2F8).copy(alpha = 0.78f)
             )
         }
     }

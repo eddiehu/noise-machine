@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.RectF
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -19,6 +23,7 @@ import androidx.media.app.NotificationCompat.MediaStyle
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import java.util.EnumMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 class NoiseService : Service() {
@@ -325,6 +330,33 @@ class NoiseService : Service() {
         return if (left > 0) "${formatDuration(left)} left" else null
     }
 
+    private val artworkCache = EnumMap<NoiseType, Bitmap>(NoiseType::class.java)
+
+    /**
+     * Album artwork for the media notification: the sound's tint color with
+     * the white wave glyph on top. Media notifications derive their
+     * background tint from the artwork, so this is what colors the
+     * notification per sound.
+     */
+    private fun artworkFor(type: NoiseType): Bitmap =
+        artworkCache.getOrPut(type) {
+            val size = 512
+            val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            canvas.drawColor(type.notifTint)
+            val wave = BitmapFactory.decodeResource(resources, R.drawable.ic_wave)
+            val s = size * 0.62f
+            canvas.drawBitmap(
+                wave, null,
+                RectF(
+                    (size - s) / 2, (size - s) / 2,
+                    (size + s) / 2, (size + s) / 2
+                ),
+                null
+            )
+            bmp
+        }
+
     private fun buildNotification(): Notification {
         val playing = voice != null
         val openIntent = PendingIntent.getActivity(
@@ -351,9 +383,9 @@ class NoiseService : Service() {
             )
             .setContentText(timerText())
             .setSmallIcon(R.drawable.ic_wave)
+            .setLargeIcon(currentType?.let(::artworkFor))
             .setContentIntent(openIntent)
             .setColor((currentType ?: lastType)?.notifTint ?: 0xFF14243D.toInt())
-            .setColorized(true)
             .addAction(
                 if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
                 if (playing) "Pause" else "Play",
