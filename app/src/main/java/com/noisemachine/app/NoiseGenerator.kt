@@ -1,5 +1,6 @@
 package com.noisemachine.app
 
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 object NoiseGenerator {
@@ -40,16 +41,29 @@ object NoiseGenerator {
                 }
             }
             NoiseType.GREEN -> {
-                // Deep rumble: heavily low-passed white noise
-                var g = 0.0
+                // "Green noise": mid-frequency focused (~500 Hz), like a gentle
+                // stream. White noise through a two-pole lowpass (~800 Hz)
+                // followed by a highpass (~300 Hz).
+                val lpA = 0.1077   // 1 - exp(-2π*800/44100)
+                val hpB = 0.9582   // exp(-2π*300/44100)
+                var s1 = 0.0
+                var s2 = 0.0
+                var hy = 0.0
+                var xp = 0.0
                 for (i in 0 until len) {
                     val w = r.nextDouble() * 2 - 1
-                    g = g * 0.986 + 0.014 * w
-                    out[i] = (g * 4.5).toFloat()
+                    s1 += lpA * (w - s1)
+                    s2 += lpA * (s1 - s2)
+                    val y = hpB * (hy + s2 - xp)
+                    xp = s2
+                    hy = y
+                    out[i] = (y * 2.32).toFloat()
                 }
             }
         }
-        // Loop crossfade: blend the head into the tail so the loop point is seamless.
+        // Loop crossfade: blend the head into the tail so the loop point is
+        // seamless. Equal-power (sqrt) weighting: a linear blend of
+        // uncorrelated noise dips ~3 dB mid-fade, heard as a periodic gap.
         val fade = SAMPLE_RATE / 4
         val n = len - fade
         val pcm = ShortArray(n)
@@ -57,7 +71,7 @@ object NoiseGenerator {
             var s = out[i]
             if (i < fade) {
                 val t = i / fade.toFloat()
-                s = out[i] * t + out[n + i] * (1f - t)
+                s = out[i] * sqrt(t) + out[n + i] * sqrt(1f - t)
             }
             pcm[i] = (s.coerceIn(-1f, 1f) * 32767).toInt().toShort()
         }

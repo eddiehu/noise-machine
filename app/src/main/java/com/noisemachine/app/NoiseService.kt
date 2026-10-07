@@ -15,19 +15,22 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
+import androidx.media.app.NotificationCompat.MediaStyle
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import java.util.concurrent.atomic.AtomicBoolean
 
 class NoiseService : Service() {
 
     companion object {
         const val ACTION_TOGGLE = "com.noisemachine.app.TOGGLE"
-        const val ACTION_SET_VOLUME = "com.noisemachine.app.SET_VOLUME"
+        const val ACTION_PLAY_PAUSE = "com.noisemachine.app.PLAY_PAUSE"
         const val ACTION_STOP_ALL = "com.noisemachine.app.STOP_ALL"
         const val ACTION_QUERY_STATE = "com.noisemachine.app.QUERY_STATE"
         const val ACTION_SET_TIMER = "com.noisemachine.app.SET_TIMER"
         const val ACTION_STATE = "com.noisemachine.app.STATE"
         const val EXTRA_TYPE = "type"
-        const val EXTRA_VOLUME = "volume"
         const val EXTRA_ACTIVE = "active"
         const val EXTRA_TIMER_MINUTES = "timer_minutes"
         const val EXTRA_TIMER_END = "timer_end"
@@ -43,17 +46,40 @@ class NoiseService : Service() {
         val thread: Thread
     )
 
-    private val voices = mutableMapOf<NoiseType, Voice>()
+    // Single-sound model: at most one voice plays at a time.
+    private var voice: Voice? = null
+    private var currentType: NoiseType? = null
+    private var lastType: NoiseType? = null
     private val buffers = mutableMapOf<NoiseType, ShortArray>()
-    private var volume = 0.7f
 
+    // Sleep timer: armed duration (minutes, 0 = none) + countdown end
+    // (null = armed but not counting; counting only runs while a sound plays).
+    private var armedTimerMinutes = 0
     private var timerEndMillis: Long? = null
-    private var lastNotifText: String? = null
+    private var fadeFactor = 1f
+
+    private lateinit var mediaSession: MediaSessionCompat
+    private var lastNotifSignature: String? = null
     private val handler = Handler(Looper.getMainLooper())
     private val timerTick = object : Runnable {
         override fun run() {
             tickTimer()
             if (timerEndMillis != null) handler.postDelayed(this, 5_000)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        mediaSession = MediaSessionCompat(this, "NoiseService").apply {
+            setFlags(
+                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
+            )
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onPlay() = resumeLast()
+                override fun onPause() = pausePlayback()
+                override fun onStop() = stopAll()
+            })
         }
     }
 
@@ -64,14 +90,11 @@ class NoiseService : Service() {
             ACTION_TOGGLE -> {
                 val type = runCatching {
                     NoiseType.valueOf(intent.getStringExtra(EXTRA_TYPE) ?: "")
-                }.getOrNull()
-                if (type != null) {
-                    if (voices.containsKey(type)) stopType(type) else startType(type)
-                }
+                }.getOrNull() ?: return START_STICKY
+                if (currentType == type) pausePlayback() else playType(type)
             }
-            ACTION_SET_VOLUME -> {
-                volume = intent.getFloatExtra(EXTRA_VOLUME, volume)
-                voices.values.forEach { it.track.setVolume(volume) }
+            ACTION_PLAY_PAUSE -> {
+                if (voice != null) pausePlayback() else resumeLast()
             }
             ACTION_STOP_ALL -> stopAll()
             ACTION_QUERY_STATE -> broadcastState()
@@ -81,11 +104,21 @@ class NoiseService : Service() {
     }
 
     override fun onDestroy() {
-        voices.keys.toList().forEach { stopType(it) }
+        stopVoiceNow()
+        handler.removeCallbacks(timerTick)
+        runCatching { mediaSession.release() }
         super.onDestroy()
     }
 
-    private fun startType(type: NoiseType) {
+    // ---- playback ----
+
+    /**
+     * Start (or swap to) a sound. A swap keeps a running sleep-timer
+     * countdown going untouched.
+     */
+    private fun playType(type: NoiseType) {
+        if (currentType == type) return
+        stopVoiceNow()
         val pcm = buffers.getOrPut(type) { NoiseGenerator.generate(type) }
         val minBuf = AudioTrack.getMinBufferSize(
             NoiseGenerator.SAMPLE_RATE,
@@ -109,15 +142,19 @@ class NoiseService : Service() {
             .setBufferSizeInBytes(maxOf(minBuf * 4, pcm.size * 2))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-        track.setVolume(volume)
+        track.setVolume(fadeFactor)
         val running = AtomicBoolean(true)
         val thread = Thread({
             track.play()
-            while (running.get()) {
+            var ioError = false
+            while (running.get() && !ioError) {
                 var offset = 0
                 while (offset < pcm.size && running.get()) {
                     val written = track.write(pcm, offset, pcm.size - offset)
-                    if (written < 0) break
+                    if (written < 0) {
+                        ioError = true
+                        break
+                    }
                     offset += written
                 }
             }
@@ -125,42 +162,95 @@ class NoiseService : Service() {
             isDaemon = true
             start()
         }
-        voices[type] = Voice(track, running, thread)
+        voice = Voice(track, running, thread)
+        currentType = type
+        lastType = type
+        // A started sound kicks off an armed timer's countdown.
+        if (armedTimerMinutes > 0 && timerEndMillis == null) startCountdown()
+        mediaSession.setMetadata(
+            MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "${type.displayName} noise")
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, "Noise Machine")
+                .build()
+        )
+        mediaSession.isActive = true
+        setPlaybackState(PlaybackStateCompat.STATE_PLAYING)
         startForegroundInternal()
         broadcastState()
     }
 
-    private fun stopType(type: NoiseType) {
-        voices.remove(type)?.let { (track, running, thread) ->
-            running.set(false)
-            thread.join(2000)
-            runCatching { track.stop() }
-            track.release()
-        }
-        if (voices.isEmpty()) {
-            timerEndMillis = null
-            handler.removeCallbacks(timerTick)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        } else {
-            updateNotification()
-        }
+    private fun resumeLast() {
+        lastType?.let { playType(it) }
+    }
+
+    /**
+     * User-initiated stop/pause: stops audio immediately and resets a
+     * running timer countdown to its full (armed) duration.
+     */
+    private fun pausePlayback() {
+        stopVoiceNow()
+        timerEndMillis = null
+        handler.removeCallbacks(timerTick)
+        fadeFactor = 1f
+        setPlaybackState(PlaybackStateCompat.STATE_PAUSED)
+        // Leave a dismissible notification so playback can resume.
+        stopForeground(STOP_FOREGROUND_DETACH)
+        updateNotification(force = true)
         broadcastState()
+    }
+
+    /**
+     * Immediate stop: halt the track first (unblocks the writer thread),
+     * then join briefly and release.
+     */
+    private fun stopVoiceNow() {
+        val v = voice ?: return
+        voice = null
+        currentType = null
+        v.running.set(false)
+        runCatching {
+            v.track.pause()
+            v.track.flush()
+            v.track.stop()
+        }
+        v.thread.join(400)
+        v.track.release()
     }
 
     private fun stopAll() {
-        voices.keys.toList().forEach { stopType(it) }
+        stopVoiceNow()
+        handler.removeCallbacks(timerTick)
+        timerEndMillis = null
+        armedTimerMinutes = 0
+        fadeFactor = 1f
+        lastType = null
+        setPlaybackState(PlaybackStateCompat.STATE_STOPPED)
+        mediaSession.isActive = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        broadcastState()
+        stopSelf()
     }
 
+    // ---- sleep timer ----
+
+    /**
+     * Arm (or disarm) the timer. The countdown only runs while a sound is
+     * playing: tapping a pill while idle just arms it.
+     */
     private fun setTimer(minutes: Int) {
         handler.removeCallbacks(timerTick)
-        timerEndMillis =
-            if (minutes > 0) System.currentTimeMillis() + minutes * 60_000L else null
-        // Restore full volume in case a previous fade was in progress.
-        voices.values.forEach { it.track.setVolume(volume) }
-        if (timerEndMillis != null) handler.post(timerTick)
+        timerEndMillis = null
+        fadeFactor = 1f
+        voice?.track?.setVolume(1f)
+        armedTimerMinutes = maxOf(0, minutes)
+        if (armedTimerMinutes > 0 && voice != null) startCountdown()
         updateNotification(force = true)
         broadcastState()
+    }
+
+    private fun startCountdown() {
+        timerEndMillis = System.currentTimeMillis() + armedTimerMinutes * 60_000L
+        handler.post(timerTick)
     }
 
     private fun tickTimer() {
@@ -172,12 +262,12 @@ class NoiseService : Service() {
             return
         }
         // Gentle fade over the last FADE_MS before stopping.
-        val factor = if (remaining < FADE_MS) {
+        fadeFactor = if (remaining < FADE_MS) {
             (remaining / FADE_MS.toFloat()).coerceIn(0f, 1f)
         } else {
             1f
         }
-        voices.values.forEach { it.track.setVolume(volume * factor) }
+        voice?.track?.setVolume(fadeFactor)
         updateNotification()
     }
 
@@ -190,11 +280,28 @@ class NoiseService : Service() {
     }
 
     private fun broadcastState() {
-        val intent = Intent(ACTION_STATE)
-            .putStringArrayListExtra(EXTRA_ACTIVE, ArrayList(voices.keys.map { it.name }))
+        Intent(ACTION_STATE)
+            .putStringArrayListExtra(EXTRA_ACTIVE, ArrayList(listOfNotNull(currentType?.name)))
+            .putExtra(EXTRA_TIMER_MINUTES, armedTimerMinutes)
             .putExtra(EXTRA_TIMER_END, timerEndMillis ?: 0L)
             .setPackage(packageName)
-        sendBroadcast(intent)
+            .let { sendBroadcast(it) }
+    }
+
+    // ---- media notification ----
+
+    private fun setPlaybackState(state: Int) {
+        mediaSession.setPlaybackState(
+            PlaybackStateCompat.Builder()
+                .setActions(
+                    PlaybackStateCompat.ACTION_PLAY or
+                        PlaybackStateCompat.ACTION_PAUSE or
+                        PlaybackStateCompat.ACTION_PLAY_PAUSE or
+                        PlaybackStateCompat.ACTION_STOP
+                )
+                .setState(state, 0L, 1f)
+                .build()
+        )
     }
 
     private fun createChannel() {
@@ -212,22 +319,22 @@ class NoiseService : Service() {
         }
     }
 
-    private fun notificationText(): String {
-        val base = if (voices.isEmpty()) {
-            "Ready"
-        } else {
-            "Playing: " + voices.keys.sortedBy { it.ordinal }
-                .joinToString(" + ") { it.displayName }
-        }
-        val end = timerEndMillis ?: return base
+    private fun timerText(): String? {
+        val end = timerEndMillis ?: return null
         val left = end - System.currentTimeMillis()
-        return if (left > 0) "$base · ${formatDuration(left)} left" else base
+        return if (left > 0) "${formatDuration(left)} left" else null
     }
 
     private fun buildNotification(): Notification {
+        val playing = voice != null
         val openIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val toggleIntent = PendingIntent.getService(
+            this, 2,
+            Intent(this, NoiseService::class.java).setAction(ACTION_PLAY_PAUSE),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val stopIntent = PendingIntent.getService(
@@ -235,31 +342,45 @@ class NoiseService : Service() {
             Intent(this, NoiseService::class.java).setAction(ACTION_STOP_ALL),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val style = MediaStyle()
+            .setMediaSession(mediaSession.sessionToken)
+            .setShowActionsInCompactView(0)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Noise Machine")
-            .setContentText(notificationText())
+            .setContentTitle(
+                if (playing) "${currentType?.displayName} noise" else "Noise Machine"
+            )
+            .setContentText(timerText())
             .setSmallIcon(R.drawable.ic_wave)
             .setContentIntent(openIntent)
+            .addAction(
+                if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+                if (playing) "Pause" else "Play",
+                toggleIntent
+            )
             .addAction(R.drawable.ic_wave, "Stop", stopIntent)
-            .setOngoing(true)
+            .setStyle(style)
+            .setOngoing(playing)
+            .setOnlyAlertOnce(true)
             .build()
     }
 
     private fun startForegroundInternal() {
         createChannel()
-        val notif = buildNotification()
+        updateNotification(force = true)
         if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            startForeground(
+                NOTIF_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            )
         } else {
-            startForeground(NOTIF_ID, notif)
+            startForeground(NOTIF_ID, buildNotification())
         }
     }
 
     private fun updateNotification(force: Boolean = false) {
-        val text = notificationText()
-        if (!force && text == lastNotifText) return
-        lastNotifText = text
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIF_ID, buildNotification())
+        val sig = "${currentType?.name}:${voice != null}:${timerText()}"
+        if (!force && sig == lastNotifSignature) return
+        lastNotifSignature = sig
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
     }
 }

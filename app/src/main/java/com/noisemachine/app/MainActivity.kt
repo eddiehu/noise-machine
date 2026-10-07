@@ -6,8 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.ContentObserver
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
@@ -54,14 +59,27 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.isActive
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
 
     private var activeTypes by mutableStateOf(setOf<NoiseType>())
-    private var volume by mutableFloatStateOf(0.7f)
     private var timerEndMillis by mutableStateOf(0L)
     private var selectedTimerMinutes by mutableStateOf(0)
+
+    private lateinit var audioManager: AudioManager
+    private var volumeFraction by mutableFloatStateOf(0f)
+    private val volumeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            volumeFraction = systemVolumeFraction()
+        }
+    }
+
+    private fun systemVolumeFraction(): Float {
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        return audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) / max.toFloat()
+    }
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -72,13 +90,15 @@ class MainActivity : ComponentActivity() {
                     .mapNotNull { runCatching { NoiseType.valueOf(it) }.getOrNull() }
                     .toSet()
                 timerEndMillis = intent.getLongExtra(NoiseService.EXTRA_TIMER_END, 0L)
-                if (timerEndMillis == 0L) selectedTimerMinutes = 0
+                selectedTimerMinutes = intent.getIntExtra(NoiseService.EXTRA_TIMER_MINUTES, 0)
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        audioManager = getSystemService(AudioManager::class.java)
+        volumeFraction = systemVolumeFraction()
         requestNotificationPermission()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -95,6 +115,10 @@ class MainActivity : ComponentActivity() {
             IntentFilter(NoiseService.ACTION_STATE),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        contentResolver.registerContentObserver(
+            Settings.System.CONTENT_URI, true, volumeObserver
+        )
+        volumeFraction = systemVolumeFraction()
         startService(
             Intent(this, NoiseService::class.java)
                 .setAction(NoiseService.ACTION_QUERY_STATE)
@@ -103,6 +127,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        runCatching { contentResolver.unregisterContentObserver(volumeObserver) }
         unregisterReceiver(stateReceiver)
     }
 
@@ -125,12 +150,11 @@ class MainActivity : ComponentActivity() {
         ContextCompat.startForegroundService(this, intent)
     }
 
-    private fun setVolumeValue(v: Float) {
-        volume = v
-        startService(
-            Intent(this, NoiseService::class.java)
-                .setAction(NoiseService.ACTION_SET_VOLUME)
-                .putExtra(NoiseService.EXTRA_VOLUME, v)
+    private fun setSystemVolume(fraction: Float) {
+        volumeFraction = fraction
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        audioManager.setStreamVolume(
+            AudioManager.STREAM_MUSIC, (fraction * max).roundToInt(), 0
         )
     }
 
@@ -178,7 +202,7 @@ class MainActivity : ComponentActivity() {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 20.dp, vertical = 16.dp)
+                    .padding(horizontal = 16.dp, vertical = 16.dp)
             ) {
                 Text(
                     text = "Noise Machine",
@@ -194,16 +218,35 @@ class MainActivity : ComponentActivity() {
                     contentAlignment = Alignment.Center
                 ) {
                     Column(
-                        verticalArrangement = Arrangement.spacedBy(26.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                        verticalArrangement = Arrangement.spacedBy(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                            NoiseCell(NoiseType.WHITE)
-                            NoiseCell(NoiseType.PINK)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.Center
+                            ) { NoiseCell(NoiseType.WHITE) }
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.Center
+                            ) { NoiseCell(NoiseType.PINK) }
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                            NoiseCell(NoiseType.BROWN)
-                            NoiseCell(NoiseType.GREEN)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.Center
+                            ) { NoiseCell(NoiseType.BROWN) }
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.Center
+                            ) { NoiseCell(NoiseType.GREEN) }
                         }
                     }
                 }
@@ -215,8 +258,8 @@ class MainActivity : ComponentActivity() {
                     color = Color(0xFFEEF2F8).copy(alpha = 0.55f)
                 )
                 Slider(
-                    value = volume,
-                    onValueChange = ::setVolumeValue,
+                    value = volumeFraction,
+                    onValueChange = ::setSystemVolume,
                     modifier = Modifier.fillMaxWidth(),
                     colors = SliderDefaults.colors(
                         thumbColor = Color(0xFF7FA8D8),
@@ -243,16 +286,11 @@ class MainActivity : ComponentActivity() {
                     TimerPill(minutes = 480, label = "8h")
                 }
                 val status = buildString {
-                    if (activeTypes.isNotEmpty()) {
-                        append(
-                            "Playing: " + activeTypes.sortedBy { it.ordinal }
-                                .joinToString(" + ") { it.displayName }
-                        )
-                    }
                     val left = timerEndMillis - nowMillis
                     if (timerEndMillis > 0 && left > 0) {
-                        if (isNotEmpty()) append(" · ")
                         append("Timer " + formatDuration(left))
+                    } else if (selectedTimerMinutes > 0) {
+                        append("Timer " + formatDuration(selectedTimerMinutes * 60_000L))
                     }
                 }
                 Box(
@@ -341,8 +379,8 @@ class MainActivity : ComponentActivity() {
         val glow = type.glowColor
         Box(
             modifier = Modifier
-                .sizeIn(maxWidth = 128.dp, maxHeight = 128.dp)
-                .fillMaxWidth(0.42f)
+                .sizeIn(maxWidth = 200.dp, maxHeight = 200.dp)
+                .fillMaxWidth()
                 .aspectRatio(1f)
                 .graphicsLayer {
                     shadowElevation = 18.dp.toPx()
